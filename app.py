@@ -1,40 +1,37 @@
 import streamlit as st
 import cv2
-import mediapipe as mp
+from ultralytics import YOLO
 import numpy as np
 import tempfile
 import time
 
-# إعدادات واجهة الميديا بايب لتتبع الجسم
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+# تحميل نموذج YOLOv8 المخصص لتقدير الوضعية (سيتم تحميله تلقائياً)
+@st.cache_resource
+def load_model():
+    return YOLO('yolov8n-pose.pt')
 
-# دالة لحساب الزوايا بين المفاصل
+model = load_model()
+
+# دالة لحساب الزوايا
 def calculate_angle(a, b, c):
-    a = np.array(a)  # نقطة البداية (مثلاً الكتف)
-    b = np.array(b)  # النقطة المركزية (مثلاً الورك)
-    c = np.array(c)  # نقطة النهاية (مثلاً الركبة)
-    
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians*180.0/np.pi)
-    
     if angle > 180.0:
         angle = 360-angle
     return angle
 
-# --- تصميم واجهة المستخدم المستجيبة (Streamlit UI) ---
+# --- واجهة المستخدم ---
 st.set_page_config(page_title="التحليل البيوميكانيكي للقفز العالي", layout="wide")
+st.title("🏃‍♂️ نظام YOLOv8 للتحليل اللحظي لفعالية القفز العالي")
 
-st.title("🏃‍♂️ نظام التحليل اللحظي لفعالية القفز العالي (Fosbury Flop)")
-st.write("هذا التطبيق يستخدم الشبكات العصبية الالتفافية لتتبع حركة اللاعب واستخراج المتغيرات الميكانيكية لحظة بلحظة.")
-
-# شريط جانبي لإدخال بيانات اللاعب
 st.sidebar.header("📊 بيانات اللاعب للمعايرة")
 weight = st.sidebar.number_input("وزن اللاعب (كجم):", min_value=30.0, max_value=150.0, value=70.0, step=0.5)
 height_cm = st.sidebar.number_input("طول اللاعب (سم):", min_value=120.0, max_value=230.0, value=185.0, step=1.0)
-height_m = height_cm / 100.0  # تحويل الطول لمتر
+height_m = height_cm / 100.0
 
-# خيارات الإدخال (بث مباشر أو رفع فيديو)
 st.sidebar.header("📹 مصدر الفيديو")
 source_option = st.sidebar.radio("اختر طريقة التحليل:", ("رفع ملف فيديو مسجل", "تشغيل البث المباشر (الكاميرا)"))
 
@@ -42,105 +39,87 @@ video_file = None
 run_live = False
 
 if source_option == "رفع ملف فيديو مسجل":
-    video_file = st.sidebar.file_uploader("قم برفع فيديو القفزة (MP4, MOV, AVI):", type=["mp4", "mov", "avi"])
+    video_file = st.sidebar.file_uploader("قم برفع فيديو القفزة:", type=["mp4", "mov", "avi"])
 else:
     run_live = st.sidebar.checkbox("فتح / إغلاق الكاميرا")
 
-# مكان عرض الفيديو والبيانات
 col1, col2 = st.columns([2, 1])
 with col1:
-    view_window = st.image([])  # نافذة عرض الفيديو المعالج
+    view_window = st.image([])
 with col2:
-    st.subheader("📈 المتغيرات البيوميكانيكية اللحظية")
+    st.subheader("📈 المتغيرات البيوميكانيكية")
     stat_velocity = st.empty()
     stat_angle = st.empty()
     stat_energy = st.empty()
 
-# --- معالجة الفيديو والذكاء الاصطناعي ---
 if video_file is not None or run_live:
-    
-    # تحديد مصدر الفيديو
     if video_file is not None:
         tfile = tempfile.NamedTemporaryFile(delete=False)
         tfile.write(video_file.read())
         cap = cv2.VideoCapture(tfile.name)
     else:
-        # 0 تعني كاميرا الحاسوب أو الموبايل الافتراضية
         cap = cv2.VideoCapture(0)
     
-    # متغيرات تتبع السرعة
     prev_time = time.time()
     prev_com_y = None
-    pixel_to_meter = None
     
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        h, w, _ = frame.shape
+        
+        # التنبؤ باستخدام YOLOv8-Pose
+        results = model(frame, verbose=False)
+        
+        if len(results) > 0 and results[0].keypoints is not None:
+            # الحصول على إحداثيات النقاط للاعب الأول المكتشف
+            kp = results[0].keypoints.xy[0].cpu().numpy()
             
-            # تحويل الألوان لأن OpenCV يقرأ BGR وميديا بايب تحتاج RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, _ = frame.shape
-            
-            # معالجة الإطار بالشبكة العصبية
-            results = pose.process(frame)
-            
-            if results.pose_landmarks:
-                # رسم الهيكل العظمي للاعب
-                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-                
-                # استخراج النقاط الرئيسية
-                landmarks = results.pose_landmarks.landmark
-                
-                # 1. حساب معامل المعايرة (Pixel-to-Meter) بناءً على طول اللاعب
-                # سنقيس المسافة بالبكسل من الكاحل إلى الأذن كمؤشر لطول الجسم الكلي
-                ankle = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w, landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * h]
-                ear = [landmarks[mp_pose.PoseLandmark.LEFT_EAR.value].x * w, landmarks[mp_pose.PoseLandmark.LEFT_EAR.value].y * h]
-                player_height_pixels = np.linalg.norm(np.array(ankle) - np.array(ear))
-                
-                if player_height_pixels > 0:
-                    pixel_to_meter = height_m / player_height_pixels
-                
-                # 2. تقريب مركز كتلة الجسم (Center of Mass) عبر نقاط الورك والجذع
-                hip_l = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y * h]
-                hip_r = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w, landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y * h]
-                shoulder_l = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * w, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * h]
-                
-                # مركز الكتلة التقريبي هو منتصف المسافة بين الحوض والكتف
-                com_x = (hip_l[0] + hip_r[0]) / 2
-                com_y = (hip_l[1] + hip_r[1]) / 2
-                
-                # 3. حساب السرعة العمودية (Vertical Velocity) والطاقة
-                current_time = time.time()
-                dt = current_time - prev_time
-                
-                if prev_com_y is not None and dt > 0 and pixel_to_meter is not None:
-                    # فارق الحركة بالبكسل وتحويله إلى أمتار
-                    dy_pixels = prev_com_y - com_y  # في الفيديو الأعلى قيمته Y أقل
-                    dy_meters = dy_pixels * pixel_to_meter
-                    velocity_y = dy_meters / dt  # السرعة م/ث
+            # التأكد من اكتشاف النقاط المطلوبة
+            if len(kp) > 10:
+                # ميديا بايب تستخدم ترتيب مختلف، هنا ترتيب نقاط YOLOv8:
+                # 5: الكتف الأيسر, 6: الكتف الأيمن, 11: الورك الأيسر, 12: الورك الأيمن, 13: الركبة اليسرى, 15: الكاحل الأيسر
+                try:
+                    shoulder_l = kp[5]
+                    hip_l = kp[11]
+                    hip_r = kp[12]
+                    knee_l = kp[13]
+                    ankle_l = kp[15]
                     
-                    # حساب الطاقة الحركية العمودية Ke = 0.5 * m * v^2
-                    kinetic_energy = 0.5 * weight * (velocity_y ** 2)
+                    # 1. المعايرة
+                    player_height_pixels = np.linalg.norm(ankle_l - shoulder_l)
+                    pixel_to_meter = height_m / player_height_pixels if player_height_pixels > 0 else 0.003
                     
-                    # 4. حساب زاوية تقوس الظهر (Arching Angle) أثناء العبور
-                    # زاوية بين الكتف - الورك - الركبة
-                    knee_l = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x * w, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y * h]
-                    arch_angle = calculate_angle(shoulder_l, hip_l, knee_l)
+                    # 2. مركز الكتلة التقريبي
+                    com_x = (hip_l[0] + hip_r[0]) / 2
+                    com_y = (hip_l[1] + hip_r[1]) / 2
                     
-                    # تحديث لوحة البيانات اللحظية
-                    stat_velocity.metric(label="السرعة العمودية الحالية (م/ث)", value=f"{velocity_y:.2f} m/s")
-                    stat_angle.metric(label="زاوية تقوس الظهر (درجة)", value=f"{arch_angle:.1f}°")
-                    stat_energy.metric(label="الطاقة الحركية العمودية (جول)", value=f"{kinetic_energy:.1f} J")
+                    # 3. الحسابات البيوميكانيكية
+                    current_time = time.time()
+                    dt = current_time - prev_time
                     
-                    # رسم نقطة مركز الكتلة على الفيديو
-                    cv2.circle(frame, (int(com_x), int(com_y)), 8, (255, 0, 0), -1)
-                
-                prev_com_y = com_y
-                prev_time = current_time
-            
-            # عرض الإطار المعالج في المتصفح
-            view_window.image(frame, channels="RGB")
-            
+                    if prev_com_y is not None and dt > 0:
+                        dy_meters = (prev_com_y - com_y) * pixel_to_meter
+                        velocity_y = dy_meters / dt
+                        kinetic_energy = 0.5 * weight * (velocity_y ** 2)
+                        arch_angle = calculate_angle(shoulder_l, hip_l, knee_l)
+                        
+                        # تحديث الشاشة
+                        stat_velocity.metric(label="السرعة العمودية (م/ث)", value=f"{velocity_y:.2f} m/s")
+                        stat_angle.metric(label="زاوية تقوس الظهر", value=f"{arch_angle:.1f}°")
+                        stat_energy.metric(label="الطاقة الحركية العمودية (جول)", value=f"{kinetic_energy:.1f} J")
+                    
+                    prev_com_y = com_y
+                    prev_time = current_time
+                    
+                except IndexError:
+                    pass
+        
+        # رسم النتائج تلقائياً بواسطة YOLO
+        annotated_frame = results[0].plot() if len(results) > 0 else frame
+        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        view_window.image(annotated_frame, channels="RGB")
+        
     cap.release()
